@@ -1,0 +1,691 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+<title>Vault</title>
+
+<!-- Makes "Add to Home Screen" launch full-screen like a real app, with its own icon and name -->
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+<meta name="apple-mobile-web-app-title" content="Vault" />
+<meta name="theme-color" content="#060B08" />
+<link rel="apple-touch-icon" href="icon-180.png" />
+<link rel="icon" type="image/png" href="icon-512.png" />
+
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&family=IBM+Plex+Mono:wght@400;500;600&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.3.1/umd/react.production.min.js" crossorigin></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.3.1/umd/react-dom.production.min.js" crossorigin></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.24.7/babel.min.js" crossorigin></script>
+<style>
+  html, body { margin: 0; padding: 0; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script type="text/babel" data-presets="react">
+const { useState, useEffect, useRef, useCallback } = React;
+
+/* ---------------------------------------------------------------
+   Vault — a live-priced ledger for gold, silver, and bitcoin
+   Data: https://gold-api.com (free, no key, CORS enabled)
+   Standalone build — host this file anywhere, no login required.
+--------------------------------------------------------------- */
+
+const ASSETS = [
+  {
+    symbol: "XAU",
+    name: "Gold",
+    unit: "oz",
+    step: "0.01",
+    accent: "#C9A227",
+    accentDim: "rgba(201,162,39,0.14)",
+    Glyph: IngotGlyph,
+  },
+  {
+    symbol: "XAG",
+    name: "Silver",
+    unit: "oz",
+    step: "0.01",
+    accent: "#C7CDD1",
+    accentDim: "rgba(199,205,209,0.14)",
+    Glyph: IngotGlyph,
+  },
+  {
+    symbol: "BTC",
+    name: "Bitcoin",
+    unit: "BTC",
+    step: "0.0001",
+    accent: "#E2891E",
+    accentDim: "rgba(226,137,30,0.14)",
+    Glyph: BitcoinGlyph,
+  },
+];
+
+const CURRENCIES = [
+  ["AUD", "Australian Dollar"],
+  ["USD", "US Dollar"],
+];
+
+const POLL_MS = 30000;
+const STORAGE_KEY = "vault-holdings-v1";
+const CURRENCY_KEY = "vault-currency-v1";
+
+function IngotGlyph({ color }) {
+  return (
+    <svg viewBox="0 0 40 26" width="22" height="15" aria-hidden="true">
+      <path d="M6 22 L11 4 H29 L34 22 Z" fill="none" stroke={color} strokeWidth="2" strokeLinejoin="round" />
+      <line x1="11.5" y1="10.5" x2="28.5" y2="10.5" stroke={color} strokeWidth="1.2" opacity="0.55" />
+    </svg>
+  );
+}
+
+function BitcoinGlyph({ color }) {
+  return (
+    <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
+      <circle cx="12" cy="12" r="10" fill="none" stroke={color} strokeWidth="1.6" />
+      <text x="12" y="16.5" textAnchor="middle" fontSize="12" fontWeight="700" fill={color} fontFamily="IBM Plex Mono, monospace">
+        ฿
+      </text>
+    </svg>
+  );
+}
+
+function formatMoney(value, currency) {
+  try {
+    return new Intl.NumberFormat("en-US", {
+      style: "currency",
+      currency,
+      maximumFractionDigits: 2,
+    }).format(value);
+  } catch {
+    return `$${value.toFixed(2)}`;
+  }
+}
+
+function OdometerDigit({ digit }) {
+  const idx = "0123456789".indexOf(digit);
+  return (
+    <span className="odo-wrap">
+      <span className="odo-strip" style={{ transform: `translateY(-${idx * 10}%)` }}>
+        {"0123456789".split("").map((d, i) => (
+          <span className="odo-digit" key={i}>{d}</span>
+        ))}
+      </span>
+    </span>
+  );
+}
+
+function OdometerValue({ text }) {
+  return (
+    <span className="odometer">
+      {text.split("").map((ch, i) =>
+        /\d/.test(ch) ? (
+          <OdometerDigit key={i} digit={ch} />
+        ) : (
+          <span className="odo-static" key={i}>{ch}</span>
+        )
+      )}
+    </span>
+  );
+}
+
+function relativeTime(ts) {
+  if (!ts) return "—";
+  const s = Math.max(0, Math.floor((Date.now() - ts) / 1000));
+  if (s < 5) return "just now";
+  if (s < 60) return `${s}s ago`;
+  const m = Math.floor(s / 60);
+  return `${m}m ${s % 60}s ago`;
+}
+
+function App() {
+  const [currency, setCurrency] = useState(() => {
+    try { return localStorage.getItem(CURRENCY_KEY) || "AUD"; } catch { return "AUD"; }
+  });
+  const [holdings, setHoldings] = useState(() => {
+    try {
+      const raw = localStorage.getItem(STORAGE_KEY);
+      return raw ? JSON.parse(raw) : { XAU: "", XAG: "", BTC: "" };
+    } catch {
+      return { XAU: "", XAG: "", BTC: "" };
+    }
+  });
+  const [prices, setPrices] = useState({});
+  const [flash, setFlash] = useState({});
+  const [errors, setErrors] = useState({});
+  const [loading, setLoading] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
+  const [lastFetch, setLastFetch] = useState(null);
+  const [feedDown, setFeedDown] = useState(false);
+  const [feedErrorDetail, setFeedErrorDetail] = useState("");
+  const [, forceTick] = useState(0);
+
+  const prevPrices = useRef({});
+  const intervalRef = useRef(null);
+  const priceEntriesRef = useRef({});
+  const cacheRef = useRef({}); // currency -> { symbol -> { price, fetchedAt } }
+
+  // ---- tick the relative-time clock ----
+  useEffect(() => {
+    const id = setInterval(() => forceTick((n) => n + 1), 1000);
+    return () => clearInterval(id);
+  }, []);
+
+  // ---- persist holdings + currency to this browser (no account needed) ----
+  useEffect(() => {
+    try { localStorage.setItem(STORAGE_KEY, JSON.stringify(holdings)); } catch { /* storage unavailable */ }
+  }, [holdings]);
+
+  useEffect(() => {
+    try { localStorage.setItem(CURRENCY_KEY, currency); } catch { /* storage unavailable */ }
+  }, [currency]);
+
+  // ---- fetch prices ----
+  const fetchAll = useCallback(async (isRefresh) => {
+    if (isRefresh) setRefreshing(true);
+    const results = await Promise.allSettled(
+      ASSETS.map((a) =>
+        fetch(`https://api.gold-api.com/price/${a.symbol}/${currency}`).then((r) => {
+          if (!r.ok) throw new Error(`${a.symbol} unavailable`);
+          return r.json();
+        })
+      )
+    );
+
+    const flashUpdate = {};
+    const nextEntries = { ...priceEntriesRef.current };
+    const nextErrors = {};
+
+    results.forEach((res, i) => {
+      const sym = ASSETS[i].symbol;
+      if (res.status === "fulfilled") {
+        const newPrice = res.value.price;
+        const old = prevPrices.current[sym];
+        if (old !== undefined && newPrice !== old) {
+          flashUpdate[sym] = newPrice > old ? "up" : "down";
+        }
+        prevPrices.current[sym] = newPrice;
+        const fetchedAt = Date.now();
+        nextEntries[sym] = { ...res.value, fetchedAt, stale: false };
+        cacheRef.current[currency] = {
+          ...(cacheRef.current[currency] || {}),
+          [sym]: { price: newPrice, fetchedAt },
+        };
+      } else {
+        console.error(`Price fetch failed for ${sym}:`, res.reason);
+        if (nextEntries[sym]) {
+          nextEntries[sym] = { ...nextEntries[sym], stale: true };
+        } else {
+          nextErrors[sym] = true;
+        }
+      }
+    });
+
+    priceEntriesRef.current = nextEntries;
+    setPrices(nextEntries);
+    setErrors(nextErrors);
+    const allDown = ASSETS.every((a) => !nextEntries[a.symbol]);
+    setFeedDown(allDown);
+    if (allDown) {
+      const firstFailure = results.find((r) => r.status === "rejected");
+      setFeedErrorDetail(firstFailure ? String(firstFailure.reason?.message || firstFailure.reason) : "");
+    }
+
+    if (Object.keys(flashUpdate).length) {
+      setFlash((f) => ({ ...f, ...flashUpdate }));
+      setTimeout(() => {
+        setFlash((f) => {
+          const c = { ...f };
+          Object.keys(flashUpdate).forEach((k) => delete c[k]);
+          return c;
+        });
+      }, 1800);
+    }
+
+    setLastFetch(Date.now());
+    setLoading(false);
+    setRefreshing(false);
+  }, [currency]);
+
+  useEffect(() => {
+    fetchAll(false);
+    clearInterval(intervalRef.current);
+    intervalRef.current = setInterval(() => fetchAll(true), POLL_MS);
+    return () => clearInterval(intervalRef.current);
+  }, [fetchAll]);
+
+  const qty = (sym) => parseFloat(holdings[sym]) || 0;
+  const rowValue = (sym) => qty(sym) * (prices[sym]?.price || 0);
+  const total = ASSETS.reduce((sum, a) => sum + rowValue(a.symbol), 0);
+  const anyHoldings = ASSETS.some((a) => qty(a.symbol) > 0);
+  const anyPriceData = ASSETS.some((a) => prices[a.symbol]);
+  const anyStale = ASSETS.some((a) => prices[a.symbol]?.stale);
+
+  function handleCurrencyChange(newCurrency) {
+    setCurrency(newCurrency);
+    const cached = cacheRef.current[newCurrency];
+    if (cached) {
+      const hydrated = {};
+      Object.entries(cached).forEach(([sym, entry]) => {
+        hydrated[sym] = { price: entry.price, fetchedAt: entry.fetchedAt, stale: true };
+        prevPrices.current[sym] = entry.price;
+      });
+      priceEntriesRef.current = hydrated;
+      setPrices(hydrated);
+      setLoading(false);
+    } else {
+      priceEntriesRef.current = {};
+      setPrices({});
+      setLoading(true);
+    }
+  }
+
+  return (
+    <div className="vault">
+      <style>{`
+        .vault, .vault * { box-sizing: border-box; }
+        .vault {
+          --bg: #060B08;
+          --surface: rgba(19, 30, 24, 0.86);
+          --surface-raised: rgba(26, 40, 32, 0.9);
+          --hairline: rgba(120, 150, 130, 0.18);
+          --text: #ECE7DC;
+          --text-muted: #93A69A;
+          --positive: #6FAE8D;
+          --negative: #C1614A;
+          --stale: #D8A13A;
+          background: linear-gradient(180deg, rgba(4,10,7,0.55), rgba(3,7,5,0.82)), url('wallpaper.jpg');
+          background-size: cover;
+          background-position: center;
+          background-attachment: fixed;
+          color: var(--text);
+          font-family: 'Inter', sans-serif;
+          min-height: 100vh;
+          padding: 28px 16px 48px;
+          display: flex;
+          justify-content: center;
+        }
+        .vault-inner { width: 100%; max-width: 640px; }
+
+        .vault-header {
+          display: flex;
+          justify-content: space-between;
+          align-items: flex-start;
+          margin-bottom: 22px;
+          gap: 12px;
+        }
+        .vault-eyebrow {
+          font-family: 'IBM Plex Mono', monospace;
+          font-size: 11px;
+          letter-spacing: 0.16em;
+          color: var(--text-muted);
+          text-transform: uppercase;
+          margin: 0 0 4px;
+        }
+        .vault-wordmark {
+          font-family: 'Space Grotesk', sans-serif;
+          font-weight: 700;
+          font-size: 26px;
+          letter-spacing: 0.02em;
+          margin: 0;
+        }
+        .vault-controls { display: flex; flex-direction: column; align-items: flex-end; gap: 8px; }
+        .currency-select {
+          background: var(--surface-raised);
+          border: 1px solid var(--hairline);
+          color: var(--text);
+          font-family: 'IBM Plex Mono', monospace;
+          font-size: 12px;
+          padding: 6px 10px;
+          border-radius: 6px;
+          cursor: pointer;
+        }
+        .currency-select:focus-visible { outline: 2px solid #C9A227; outline-offset: 1px; }
+        .live-row {
+          display: flex; align-items: center; gap: 6px;
+          font-family: 'IBM Plex Mono', monospace;
+          font-size: 11px; color: var(--text-muted);
+        }
+        .live-dot {
+          width: 6px; height: 6px; border-radius: 50%;
+          background: var(--positive);
+          animation: pulse 2s ease-in-out infinite;
+        }
+        @keyframes pulse {
+          0%, 100% { opacity: 1; box-shadow: 0 0 0 0 rgba(111,174,141,0.5); }
+          50% { opacity: 0.55; box-shadow: 0 0 0 4px rgba(111,174,141,0); }
+        }
+        .refresh-btn {
+          background: none; border: none; color: var(--text-muted);
+          cursor: pointer; padding: 0; font-family: 'IBM Plex Mono', monospace; font-size: 11px;
+          text-decoration: underline; text-underline-offset: 2px;
+        }
+        .refresh-btn:hover { color: var(--text); }
+        .refresh-btn[disabled] { opacity: 0.5; cursor: default; }
+
+        .feed-banner {
+          background: rgba(193,97,74,0.12);
+          border: 1px solid rgba(193,97,74,0.4);
+          color: var(--text);
+          font-size: 12.5px;
+          border-radius: 8px;
+          padding: 10px 12px;
+          margin-bottom: 16px;
+          line-height: 1.5;
+        }
+        .feed-banner .refresh-btn { color: var(--text); font-weight: 600; }
+        .feed-banner-detail {
+          margin-top: 6px;
+          font-size: 11px;
+          opacity: 0.75;
+          word-break: break-word;
+        }
+
+        .hero {
+          background: var(--surface);
+          backdrop-filter: blur(14px);
+          -webkit-backdrop-filter: blur(14px);
+          border: 1px solid var(--hairline);
+          border-radius: 14px;
+          padding: 26px 22px;
+          margin-bottom: 22px;
+          animation: rise 0.5s ease both;
+        }
+        .hero-label {
+          font-family: 'IBM Plex Mono', monospace;
+          font-size: 11px; letter-spacing: 0.14em; text-transform: uppercase;
+          color: var(--text-muted); margin: 0 0 10px;
+        }
+        .odometer {
+          font-family: 'IBM Plex Mono', monospace;
+          font-weight: 500;
+          font-size: 40px;
+          font-variant-numeric: tabular-nums;
+          display: inline-flex;
+          align-items: baseline;
+          color: var(--text);
+        }
+        .odo-wrap {
+          display: inline-block;
+          height: 1em;
+          width: 1ch;
+          overflow: hidden;
+          line-height: 1em;
+        }
+        .odo-strip {
+          display: flex;
+          flex-direction: column;
+          transition: transform 0.65s cubic-bezier(0.22,1,0.36,1);
+        }
+        .odo-digit { height: 1em; line-height: 1em; text-align: center; }
+        .odo-static { display: inline-block; }
+        .hero-hint {
+          font-size: 12.5px; color: var(--text-muted); margin: 10px 0 0;
+        }
+
+        .ledger { display: flex; flex-direction: column; gap: 10px; }
+        .row {
+          background: var(--surface);
+          backdrop-filter: blur(14px);
+          -webkit-backdrop-filter: blur(14px);
+          border: 1px solid var(--hairline);
+          border-left: 3px solid var(--accent, var(--hairline));
+          border-radius: 10px;
+          padding: 14px 16px;
+          display: grid;
+          grid-template-columns: auto 1fr auto;
+          gap: 8px 14px;
+          align-items: center;
+          animation: rise 0.5s ease both;
+        }
+        .row:nth-of-type(1) { animation-delay: 0.05s; }
+        .row:nth-of-type(2) { animation-delay: 0.12s; }
+        .row:nth-of-type(3) { animation-delay: 0.19s; }
+        @keyframes rise {
+          from { opacity: 0; transform: translateY(6px); }
+          to { opacity: 1; transform: translateY(0); }
+        }
+        .row-icon {
+          width: 34px; height: 34px; border-radius: 8px;
+          background: var(--chip-bg, var(--surface-raised));
+          display: flex; align-items: center; justify-content: center;
+        }
+        .row-name-block { min-width: 0; }
+        .row-name {
+          font-family: 'Space Grotesk', sans-serif; font-weight: 700;
+          font-size: 15px; margin: 0;
+        }
+        .row-symbol {
+          font-family: 'IBM Plex Mono', monospace; font-size: 10.5px;
+          color: var(--text-muted); letter-spacing: 0.06em;
+        }
+        .row-price-line {
+          grid-column: 1 / -1;
+          display: flex; align-items: center; justify-content: space-between;
+          border-top: 1px solid var(--hairline);
+          margin-top: 4px; padding-top: 10px;
+          gap: 10px; flex-wrap: wrap;
+        }
+        .qty-field { display: flex; align-items: center; gap: 6px; }
+        .qty-field label {
+          font-size: 11px; color: var(--text-muted); font-family: 'IBM Plex Mono', monospace;
+        }
+        .qty-input {
+          width: 92px;
+          background: var(--surface-raised);
+          border: 1px solid var(--hairline);
+          color: var(--text);
+          font-family: 'IBM Plex Mono', monospace;
+          font-size: 13px;
+          text-align: right;
+          padding: 6px 8px;
+          border-radius: 6px;
+        }
+        .qty-input:focus-visible { outline: 2px solid var(--accent, #C9A227); outline-offset: 1px; }
+        .price-stats { text-align: right; }
+        .unit-price {
+          font-family: 'IBM Plex Mono', monospace; font-size: 13px;
+          transition: color 0.3s ease, background-color 0.3s ease;
+          padding: 2px 4px; border-radius: 4px;
+        }
+        .unit-price.up { color: var(--positive); background: rgba(111,174,141,0.12); }
+        .unit-price.down { color: var(--negative); background: rgba(193,97,74,0.12); }
+        .stale-tag {
+          font-family: 'IBM Plex Mono', monospace;
+          font-size: 10px;
+          color: var(--stale);
+          margin-top: 3px;
+        }
+        .row-total {
+          font-family: 'IBM Plex Mono', monospace; font-weight: 600; font-size: 15px;
+          margin-top: 2px;
+        }
+        .row-error { font-size: 11px; color: var(--negative); font-family: 'IBM Plex Mono', monospace; }
+        .skeleton {
+          display: inline-block; width: 64px; height: 13px; border-radius: 3px;
+          background: linear-gradient(90deg, var(--surface-raised) 25%, var(--hairline) 50%, var(--surface-raised) 75%);
+          background-size: 200% 100%;
+          animation: shimmer 1.4s infinite;
+        }
+        @keyframes shimmer { 0% { background-position: 200% 0; } 100% { background-position: -200% 0; } }
+
+        .footer {
+          margin-top: 26px; display: flex; justify-content: space-between;
+          flex-wrap: wrap; gap: 8px;
+          font-size: 11px; color: var(--text-muted); font-family: 'IBM Plex Mono', monospace;
+        }
+        .footer button {
+          background: none; border: none; color: var(--text-muted);
+          text-decoration: underline; text-underline-offset: 2px; cursor: pointer;
+          font-family: 'IBM Plex Mono', monospace; font-size: 11px; padding: 0;
+        }
+        .footer button:hover { color: var(--text); }
+
+        @media (max-width: 420px) {
+          .odometer { font-size: 32px; }
+          .row { grid-template-columns: auto 1fr; }
+          .row-price-line { justify-content: flex-start; }
+        }
+
+        @media (prefers-reduced-motion: reduce) {
+          .live-dot { animation: none; }
+          .odo-strip { transition: none; }
+          .row, .hero { animation: none; }
+          .skeleton { animation: none; }
+        }
+      `}</style>
+
+      <div className="vault-inner">
+        <header className="vault-header">
+          <div>
+            <p className="vault-eyebrow">Portfolio</p>
+            <h1 className="vault-wordmark">Vault</h1>
+          </div>
+          <div className="vault-controls">
+            <select
+              className="currency-select"
+              value={currency}
+              onChange={(e) => handleCurrencyChange(e.target.value)}
+              aria-label="Display currency"
+            >
+              {CURRENCIES.map(([code, name]) => (
+                <option key={code} value={code}>{code} — {name}</option>
+              ))}
+            </select>
+            <div className="live-row">
+              <span
+                className="live-dot"
+                aria-hidden="true"
+                style={{
+                  background: !anyPriceData
+                    ? "var(--negative)"
+                    : anyStale
+                    ? "var(--stale)"
+                    : "var(--positive)",
+                }}
+              />
+              <span>
+                {!anyPriceData && loading
+                  ? "connecting…"
+                  : anyStale
+                  ? "last known · retrying…"
+                  : `live · updated ${relativeTime(lastFetch)}`}
+              </span>
+              <button
+                className="refresh-btn"
+                onClick={() => fetchAll(true)}
+                disabled={refreshing || (loading && !anyPriceData)}
+              >
+                {refreshing ? "refreshing" : "refresh"}
+              </button>
+            </div>
+          </div>
+        </header>
+
+        {feedDown && !loading && (
+          <div className="feed-banner">
+            Can't reach the live price feed right now, so totals show as 0.{" "}
+            <button className="refresh-btn" onClick={() => fetchAll(true)}>
+              try again
+            </button>
+            {feedErrorDetail && (
+              <div className="feed-banner-detail">Error: {feedErrorDetail}</div>
+            )}
+          </div>
+        )}
+
+        <section className="hero">
+          <p className="hero-label">Total value</p>
+          {!anyPriceData && loading ? (
+            <span className="skeleton" style={{ width: 180, height: 40 }} />
+          ) : (
+            <OdometerValue text={formatMoney(total, currency)} />
+          )}
+          {anyPriceData && !anyHoldings && (
+            <p className="hero-hint">Add your holdings below to see their live value.</p>
+          )}
+          {anyStale && (
+            <p className="hero-hint">Showing last known prices while the feed reconnects.</p>
+          )}
+        </section>
+
+        <section className="ledger" aria-label="Holdings">
+          {ASSETS.map((asset) => {
+            const p = prices[asset.symbol];
+            const hasError = errors[asset.symbol];
+            const flashState = flash[asset.symbol];
+            return (
+              <div
+                className="row"
+                key={asset.symbol}
+                style={{ "--accent": asset.accent, "--chip-bg": asset.accentDim }}
+              >
+                <div className="row-icon">
+                  <asset.Glyph color={asset.accent} />
+                </div>
+                <div className="row-name-block">
+                  <p className="row-name">{asset.name}</p>
+                  <span className="row-symbol">{asset.symbol} · per {asset.unit}</span>
+                </div>
+                <div className="price-stats">
+                  {p ? (
+                    <>
+                      <span className={`unit-price ${flashState || ""}`}>
+                        {formatMoney(p.price, currency)}
+                      </span>
+                      {p.stale && (
+                        <div className="stale-tag">last known · {relativeTime(p.fetchedAt)}</div>
+                      )}
+                    </>
+                  ) : hasError ? (
+                    <span className="row-error">price unavailable</span>
+                  ) : (
+                    <span className="skeleton" />
+                  )}
+                </div>
+
+                <div className="row-price-line">
+                  <div className="qty-field">
+                    <label htmlFor={`qty-${asset.symbol}`}>Holdings ({asset.unit})</label>
+                    <input
+                      id={`qty-${asset.symbol}`}
+                      className="qty-input"
+                      type="number"
+                      min="0"
+                      step={asset.step}
+                      inputMode="decimal"
+                      placeholder="0"
+                      value={holdings[asset.symbol]}
+                      onChange={(e) =>
+                        setHoldings((h) => ({ ...h, [asset.symbol]: e.target.value }))
+                      }
+                    />
+                  </div>
+                  <div className="row-total">
+                    {p ? formatMoney(rowValue(asset.symbol), currency) : <span className="skeleton" />}
+                  </div>
+                </div>
+              </div>
+            );
+          })}
+        </section>
+
+        <footer className="footer">
+          <span>Prices via gold-api.com · refreshes every 30s · not financial advice</span>
+          <button onClick={() => setHoldings({ XAU: "", XAG: "", BTC: "" })}>
+            clear holdings
+          </button>
+        </footer>
+      </div>
+    </div>
+  );
+}
+
+const root = ReactDOM.createRoot(document.getElementById("root"));
+root.render(<App />);
+</script>
+</body>
+</html>
